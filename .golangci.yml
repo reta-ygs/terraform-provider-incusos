@@ -1,0 +1,31 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - unconvert
+    - unparam
+  settings:
+    gosec:
+      excludes:
+        - G304 # Reading user-configured certificate files by path is intentional.
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+  settings:
+    gofmt:
+      simplify: true

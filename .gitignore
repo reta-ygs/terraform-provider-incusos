@@ -1,0 +1,36 @@
+# Binaries
+terraform-provider-incusos
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Coverage
+*.out
+coverage.html
+
+# Terraform local state
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.tfvars
+terraform.tfvars.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Explicitly track release and lint configs even when global gitignore ignores dotfiles
+!.goreleaser.yml
+!.golangci.yml

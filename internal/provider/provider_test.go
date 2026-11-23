@@ -1,0 +1,401 @@
+package provider
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+)
+
+func testAccProtoV6ProviderFactories() map[string]func() (tfprotov6.ProviderServer, error) {
+	return map[string]func() (tfprotov6.ProviderServer, error){
+		"incusos": providerserver.NewProtocol6WithError(New("test")()),
+	}
+}
+
+func TestAccDataSources(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+data "incusos_server" "this" {}
+data "incusos_system_storage" "this" {}
+data "incusos_system_security" "this" {}
+data "incusos_system_network" "this" {}
+data "incusos_system_resources" "this" {}
+data "incusos_applications" "this" {}
+data "incusos_services" "this" {}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("data.incusos_server.this", "hostname", "incusos-node-1"),
+					resource.TestCheckResourceAttr("data.incusos_server.this", "os_name", "IncusOS"),
+					resource.TestCheckResourceAttr("data.incusos_server.this", "system_is_ready", "true"),
+					resource.TestCheckResourceAttr("data.incusos_system_storage.this", "drives.#", "2"),
+					resource.TestCheckResourceAttr("data.incusos_system_storage.this", "drives.0.boot", "true"),
+					resource.TestCheckResourceAttr("data.incusos_system_security.this", "secure_boot_enabled", "true"),
+					resource.TestCheckResourceAttr("data.incusos_system_security.this", "tpm_status", "ok"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.state", "routable"),
+					resource.TestCheckResourceAttrSet("data.incusos_system_resources.this", "json"),
+					resource.TestCheckResourceAttr("data.incusos_applications.this", "applications.0", "incus"),
+					resource.TestCheckResourceAttr("data.incusos_services.this", "services.#", "10"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccSystemResources(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_network" "this" {
+  confirmation_timeout = "60s"
+  auto_confirm         = true
+
+  dns = {
+    hostname    = "node-01"
+    domain      = "example.internal"
+    nameservers = ["1.1.1.1", "8.8.8.8"]
+  }
+
+  time = {
+    timezone    = "Asia/Tokyo"
+    ntp_servers = ["ntp.nict.jp"]
+  }
+
+  interfaces = [
+    {
+      name      = "enp1s0"
+      hwaddr    = "00:11:22:33:44:55"
+      addresses = ["192.0.2.10/24"]
+      roles     = ["management"]
+      mtu       = 1500
+    }
+  ]
+}
+
+resource "incusos_system_kernel" "this" {
+  blacklist_modules = ["nouveau"]
+  network = {
+    tcp_congestion_algorithm = "bbr"
+    tcp_mtu_probing          = true
+  }
+  zfs = {
+    arc_max_size = "8GiB"
+  }
+}
+
+resource "incusos_system_logging" "this" {
+  syslog = {
+    address  = "192.0.2.50:514"
+    protocol = "tcp"
+  }
+}
+
+resource "incusos_system_power" "this" {
+  cpu_scaling_governor              = "performance"
+  cpu_energy_performance_preference = "balance_performance"
+}
+
+resource "incusos_system_provider" "this" {
+  name = "images"
+}
+
+resource "incusos_system_security" "this" {
+  custom_ca_certs = ["-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----"]
+}
+
+resource "incusos_system_update" "this" {
+  channel         = "stable"
+  check_frequency = "6h"
+  auto_reboot     = false
+  maintenance_windows = [
+    {
+      start_day_of_week = "Sunday"
+      start_hour        = 2
+      start_minute      = 0
+      end_day_of_week   = "Sunday"
+      end_hour          = 4
+      end_minute        = 0
+    }
+  ]
+}
+
+resource "incusos_system_fallback_listener" "this" {
+  listen_address = ":8444"
+  persistent     = true
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("incusos_system_network.this", "dns.hostname", "node-01"),
+					resource.TestCheckResourceAttr("incusos_system_network.this", "time.timezone", "Asia/Tokyo"),
+					resource.TestCheckResourceAttr("incusos_system_kernel.this", "zfs.arc_max_size", "8GiB"),
+					resource.TestCheckResourceAttr("incusos_system_kernel.this", "clock_source", "tsc"),
+					resource.TestCheckResourceAttr("incusos_system_logging.this", "syslog.address", "192.0.2.50:514"),
+					resource.TestCheckResourceAttr("incusos_system_power.this", "cpu_scaling_governor", "performance"),
+					resource.TestCheckResourceAttr("incusos_system_power.this", "cpu_scaling_driver", "amd-pstate-epp"),
+					resource.TestCheckResourceAttr("incusos_system_provider.this", "registered", "true"),
+					resource.TestCheckResourceAttr("incusos_system_security.this", "tpm_status", "ok"),
+					resource.TestCheckResourceAttr("incusos_system_update.this", "channel", "stable"),
+					resource.TestCheckResourceAttr("incusos_system_fallback_listener.this", "active", "true"),
+				),
+			},
+			{
+				ResourceName:      "incusos_system_update.this",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+
+	if !mock.networkConfirmed {
+		t.Fatalf("expected network changes to be auto-confirmed via POST /1.0/system/network/:confirm")
+	}
+}
+
+func TestAccStoragePoolAndVolume(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_storage" "schedules" {
+  scrub_schedule = "0 3 * * 0"
+  trim_schedule  = "0 4 * * 0"
+}
+
+resource "incusos_system_storage_pool" "data" {
+  name    = "data"
+  type    = "zfs-raid0"
+  devices = ["/dev/disk/by-id/nvme-test-1"]
+}
+
+resource "incusos_system_storage_volume" "incus_vol" {
+  pool           = incusos_system_storage_pool.data.name
+  name           = "incus-default"
+  use            = "incus"
+  quota_in_bytes = 107374182400
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("incusos_system_storage.schedules", "scrub_schedule", "0 3 * * 0"),
+					resource.TestCheckResourceAttr("incusos_system_storage_pool.data", "state", "ONLINE"),
+					resource.TestCheckResourceAttr("incusos_system_storage_pool.data", "managed", "true"),
+					resource.TestCheckResourceAttr("incusos_system_storage_volume.incus_vol", "id", "data/incus-default"),
+					resource.TestCheckResourceAttr("incusos_system_storage_volume.incus_vol", "use", "incus"),
+				),
+			},
+			{
+				ResourceName:      "incusos_system_storage_pool.data",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				ResourceName:      "incusos_system_storage_volume.incus_vol",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func TestAccApplication(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_application" "gpu" {
+  name                 = "gpu-support"
+  pin_current_versions = false
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("incusos_application.gpu", "name", "gpu-support"),
+					resource.TestCheckResourceAttr("incusos_application.gpu", "initialized", "true"),
+					resource.TestCheckResourceAttr("incusos_application.gpu", "pin_current_versions", "false"),
+				),
+			},
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_application" "gpu" {
+  name                 = "gpu-support"
+  pin_current_versions = true
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("incusos_application.gpu", "pin_current_versions", "true"),
+				),
+			},
+			{
+				ResourceName:      "incusos_application.gpu",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func TestAccServices(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_service_tailscale" "this" {
+  enabled       = true
+  accept_routes = true
+  auth_key      = "tskey-auth-example"
+}
+
+resource "incusos_service_ovn" "this" {
+  enabled         = true
+  database        = "ssl:192.0.2.20:6642"
+  tunnel_address  = "192.0.2.10"
+  tunnel_protocol = "geneve"
+}
+
+resource "incusos_service_ceph" "this" {
+  enabled = true
+  clusters = {
+    ceph = {
+      fsid     = "11111111-2222-3333-4444-555555555555"
+      monitors = ["192.0.2.30:6789"]
+      keyrings = {
+        admin = "AQBtestkey=="
+      }
+    }
+  }
+}
+
+resource "incusos_service_iscsi" "this" {
+  enabled = true
+  targets = [
+    {
+      target  = "iqn.2026-01.example.com:lun0"
+      address = "192.0.2.40"
+      port    = 3260
+    }
+  ]
+}
+
+resource "incusos_service_linstor" "this" {
+  enabled        = true
+  listen_address = "192.0.2.10"
+}
+
+resource "incusos_service_lvm" "this" {
+  enabled   = true
+  system_id = 1
+}
+
+resource "incusos_service_multipath" "this" {
+  enabled              = true
+  automatic_transports = ["iscsi"]
+}
+
+resource "incusos_service_netbird" "this" {
+  enabled   = true
+  setup_key = "nb-setup-key"
+}
+
+resource "incusos_service_nvme" "this" {
+  enabled = true
+  targets = [
+    {
+      transport = "tcp"
+      address   = "192.0.2.41"
+      port      = 4420
+    }
+  ]
+}
+
+resource "incusos_service_usbip" "this" {
+  enabled = true
+  targets = [
+    {
+      address = "192.0.2.42"
+      bus_id  = "1-1"
+    }
+  ]
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("incusos_service_tailscale.this", "backend_state", "Running"),
+					resource.TestCheckResourceAttr("incusos_service_tailscale.this", "tailnet_name", "example.ts.net"),
+					resource.TestCheckResourceAttr("incusos_service_ovn.this", "database", "ssl:192.0.2.20:6642"),
+					resource.TestCheckResourceAttr("incusos_service_ceph.this", "clusters.ceph.fsid", "11111111-2222-3333-4444-555555555555"),
+					resource.TestCheckResourceAttr("incusos_service_iscsi.this", "initiator_name", "iqn.2026-01.org.incusos:node01"),
+					resource.TestCheckResourceAttr("incusos_service_linstor.this", "listen_address", "192.0.2.10"),
+					resource.TestCheckResourceAttr("incusos_service_lvm.this", "system_id", "1"),
+					resource.TestCheckResourceAttr("incusos_service_multipath.this", "automatic_transports.0", "iscsi"),
+					resource.TestCheckResourceAttr("incusos_service_netbird.this", "setup_key", "nb-setup-key"),
+					resource.TestCheckResourceAttr("incusos_service_nvme.this", "host_id", "host-uuid-1"),
+					resource.TestCheckResourceAttr("incusos_service_usbip.this", "targets.0.bus_id", "1-1"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccProviderIncusRemoteEnvVar(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	confDir := t.TempDir()
+	serverCertsDir := filepath.Join(confDir, "servercerts")
+	if err := os.MkdirAll(serverCertsDir, 0o700); err != nil {
+		t.Fatalf("creating servercerts dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(confDir, "client.crt"), []byte(mock.clientCertPEM), 0o600); err != nil {
+		t.Fatalf("writing client.crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "client.key"), []byte(mock.clientKeyPEM), 0o600); err != nil {
+		t.Fatalf("writing client.key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(serverCertsDir, "node-01.crt"), []byte(mock.serverCertPEM), 0o600); err != nil {
+		t.Fatalf("writing server cert: %v", err)
+	}
+
+	configYAML := "default-remote: local\nremotes:\n  node-01:\n    addr: " + mock.server.URL + "\n    protocol: incus\n    public: false\n"
+	if err := os.WriteFile(filepath.Join(confDir, "config.yml"), []byte(configYAML), 0o600); err != nil {
+		t.Fatalf("writing config.yml: %v", err)
+	}
+
+	// Inject INCUS_CONF and INCUS_REMOTE just like the Incus CLI.
+	t.Setenv("INCUS_CONF", confDir)
+	t.Setenv("INCUS_REMOTE", "node-01")
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: `
+provider "incusos" {}
+
+data "incusos_server" "this" {}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("data.incusos_server.this", "hostname", "incusos-node-1"),
+					resource.TestCheckResourceAttr("data.incusos_server.this", "os_name", "IncusOS"),
+				),
+			},
+		},
+	})
+}
