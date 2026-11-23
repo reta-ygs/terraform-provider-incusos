@@ -31,9 +31,11 @@
         "minor",
         "patch",
         "digest",
-        "pin"
+        "pin",
+        "pinDigest"
       ],
-      "groupName": "github-actions"
+      "groupName": "github-actions",
+      "groupSlug": "github-actions"
     },
     {
       "description": "Group non-major Terraform Plugin Framework & Testing updates",
