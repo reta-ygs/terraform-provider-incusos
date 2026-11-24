@@ -28,8 +28,51 @@ Read-Only:
 
 - `addresses` (List of String)
 - `hwaddr` (String)
+- `lldp` (Attributes List) (see [below for nested schema](#nestedatt--interfaces--lldp))
+- `members` (Attributes Map) (see [below for nested schema](#nestedatt--interfaces--members))
 - `mtu` (Number)
 - `roles` (List of String)
 - `speed` (String)
 - `state` (String)
 - `type` (String)
+
+<a id="nestedatt--interfaces--lldp"></a>
+### Nested Schema for `interfaces.lldp`
+
+Read-Only:
+
+- `capabilities` (List of String)
+- `chassis_id` (String)
+- `description` (String)
+- `name` (String)
+- `port` (String)
+- `port_id` (String)
+- `vlan` (Number)
+
+
+<a id="nestedatt--interfaces--members"></a>
+### Nested Schema for `interfaces.members`
+
+Read-Only:
+
+- `addresses` (List of String)
+- `hwaddr` (String)
+- `lldp` (Attributes List) (see [below for nested schema](#nestedatt--interfaces--members--lldp))
+- `mtu` (Number)
+- `roles` (List of String)
+- `speed` (String)
+- `state` (String)
+- `type` (String)
+
+<a id="nestedatt--interfaces--members--lldp"></a>
+### Nested Schema for `interfaces.members.lldp`
+
+Read-Only:
+
+- `capabilities` (List of String)
+- `chassis_id` (String)
+- `description` (String)
+- `name` (String)
+- `port` (String)
+- `port_id` (String)
+- `vlan` (Number)

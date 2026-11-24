@@ -48,6 +48,19 @@ data "incusos_services" "this" {}
 					resource.TestCheckResourceAttr("data.incusos_system_security.this", "secure_boot_enabled", "true"),
 					resource.TestCheckResourceAttr("data.incusos_system_security.this", "tpm_status", "ok"),
 					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.state", "routable"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.#", "1"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.0.name", "sw-core-01"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.0.description", "Core Switch OS 1.0"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.0.chassis_id", "aa:bb:cc:dd:ee:ff"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.0.port_id", "Ethernet1/1"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.0.port", "uplink-node-01"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.0.vlan", "100"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.0.capabilities.#", "2"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.0.capabilities.0", "bridge"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.enp1s0.lldp.0.capabilities.1", "router"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.bond0.members.enp2s0.lldp.#", "1"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.bond0.members.enp2s0.lldp.0.name", "sw-leaf-01"),
+					resource.TestCheckResourceAttr("data.incusos_system_network.this", "interfaces.bond0.members.enp2s0.lldp.0.vlan", "200"),
 					resource.TestCheckResourceAttrSet("data.incusos_system_resources.this", "json"),
 					resource.TestCheckResourceAttr("data.incusos_applications.this", "applications.0", "incus"),
 					resource.TestCheckResourceAttr("data.incusos_services.this", "services.#", "10"),
@@ -82,11 +95,22 @@ resource "incusos_system_network" "this" {
 
   interfaces = [
     {
-      name      = "enp1s0"
-      hwaddr    = "00:11:22:33:44:55"
-      addresses = ["192.0.2.10/24"]
-      roles     = ["management"]
-      mtu       = 1500
+      name              = "enp1s0"
+      hwaddr            = "00:11:22:33:44:55"
+      addresses         = ["192.0.2.10/24"]
+      roles             = ["management"]
+      mtu               = 1500
+      lldp_receive_only = true
+    }
+  ]
+
+  bonds = [
+    {
+      name              = "bond0"
+      mode              = "802.3ad"
+      members           = ["00:11:22:33:44:66"]
+      roles             = ["instances"]
+      lldp_receive_only = true
     }
   ]
 }
@@ -112,6 +136,7 @@ resource "incusos_system_logging" "this" {
 resource "incusos_system_power" "this" {
   cpu_scaling_governor              = "performance"
   cpu_energy_performance_preference = "balance_performance"
+  screen_blank_timeout              = 10
 }
 
 resource "incusos_system_provider" "this" {
@@ -146,11 +171,14 @@ resource "incusos_system_fallback_listener" "this" {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("incusos_system_network.this", "dns.hostname", "node-01"),
 					resource.TestCheckResourceAttr("incusos_system_network.this", "time.timezone", "Asia/Tokyo"),
+					resource.TestCheckResourceAttr("incusos_system_network.this", "interfaces.0.lldp_receive_only", "true"),
+					resource.TestCheckResourceAttr("incusos_system_network.this", "bonds.0.lldp_receive_only", "true"),
 					resource.TestCheckResourceAttr("incusos_system_kernel.this", "zfs.arc_max_size", "8GiB"),
 					resource.TestCheckResourceAttr("incusos_system_kernel.this", "clock_source", "tsc"),
 					resource.TestCheckResourceAttr("incusos_system_logging.this", "syslog.address", "192.0.2.50:514"),
 					resource.TestCheckResourceAttr("incusos_system_power.this", "cpu_scaling_governor", "performance"),
 					resource.TestCheckResourceAttr("incusos_system_power.this", "cpu_scaling_driver", "amd-pstate-epp"),
+					resource.TestCheckResourceAttr("incusos_system_power.this", "screen_blank_timeout", "10"),
 					resource.TestCheckResourceAttr("incusos_system_provider.this", "registered", "true"),
 					resource.TestCheckResourceAttr("incusos_system_security.this", "tpm_status", "ok"),
 					resource.TestCheckResourceAttr("incusos_system_update.this", "channel", "stable"),
@@ -168,6 +196,49 @@ resource "incusos_system_fallback_listener" "this" {
 	if !mock.networkConfirmed {
 		t.Fatalf("expected network changes to be auto-confirmed via POST /1.0/system/network/:confirm")
 	}
+}
+
+func TestAccSystemPowerScreenBlanking(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_power" "this" {
+  screen_blank_timeout = 10
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("incusos_system_power.this", "screen_blank_timeout", "10"),
+				),
+			},
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_power" "this" {
+  screen_blank_timeout = 0
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("incusos_system_power.this", "screen_blank_timeout", "0"),
+				),
+			},
+			{
+				ResourceName:      "incusos_system_power.this",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_power" "this" {}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("incusos_system_power.this", "screen_blank_timeout"),
+				),
+			},
+		},
+	})
 }
 
 func TestAccStoragePoolAndVolume(t *testing.T) {

@@ -97,6 +97,7 @@ type systemNetworkInterfaceModel struct {
 	Roles             types.List                       `tfsdk:"roles"`
 	MTU               types.Int64                      `tfsdk:"mtu"`
 	LLDP              types.Bool                       `tfsdk:"lldp"`
+	LLDPReceiveOnly   types.Bool                       `tfsdk:"lldp_receive_only"`
 	RequiredForOnline types.String                     `tfsdk:"required_for_online"`
 	StrictHwaddr      types.Bool                       `tfsdk:"strict_hwaddr"`
 	VLANTags          types.List                       `tfsdk:"vlan_tags"`
@@ -124,6 +125,7 @@ type systemNetworkBondModel struct {
 	Roles             types.List                       `tfsdk:"roles"`
 	MTU               types.Int64                      `tfsdk:"mtu"`
 	LLDP              types.Bool                       `tfsdk:"lldp"`
+	LLDPReceiveOnly   types.Bool                       `tfsdk:"lldp_receive_only"`
 	RequiredForOnline types.String                     `tfsdk:"required_for_online"`
 	VLANTags          types.List                       `tfsdk:"vlan_tags"`
 	Options           *systemNetworkBondOptionsModel   `tfsdk:"options"`
@@ -294,6 +296,7 @@ func (r *systemNetworkResource) Schema(_ context.Context, _ resource.SchemaReque
 						"roles":               schema.ListAttribute{ElementType: types.StringType, Optional: true},
 						"mtu":                 schema.Int64Attribute{Optional: true},
 						"lldp":                schema.BoolAttribute{Optional: true},
+						"lldp_receive_only":   schema.BoolAttribute{Optional: true},
 						"required_for_online": schema.StringAttribute{Optional: true},
 						"strict_hwaddr":       schema.BoolAttribute{Optional: true},
 						"vlan_tags":           schema.ListAttribute{ElementType: types.Int64Type, Optional: true},
@@ -315,6 +318,7 @@ func (r *systemNetworkResource) Schema(_ context.Context, _ resource.SchemaReque
 						"roles":               schema.ListAttribute{ElementType: types.StringType, Optional: true},
 						"mtu":                 schema.Int64Attribute{Optional: true},
 						"lldp":                schema.BoolAttribute{Optional: true},
+						"lldp_receive_only":   schema.BoolAttribute{Optional: true},
 						"required_for_online": schema.StringAttribute{Optional: true},
 						"vlan_tags":           schema.ListAttribute{ElementType: types.Int64Type, Optional: true},
 						"options": schema.SingleNestedAttribute{
@@ -625,6 +629,7 @@ func (m *systemNetworkModel) toAPI(ctx context.Context, diags *diag.Diagnostics)
 			Roles:             listToStringSlice(ctx, iface.Roles, diags),
 			MTU:               int(iface.MTU.ValueInt64()),
 			LLDP:              iface.LLDP.ValueBool(),
+			LLDPReceiveOnly:   iface.LLDPReceiveOnly.ValueBool(),
 			RequiredForOnline: iface.RequiredForOnline.ValueString(),
 			StrictHwaddr:      iface.StrictHwaddr.ValueBool(),
 			VLANTags:          listToIntSlice(ctx, iface.VLANTags, diags),
@@ -644,6 +649,7 @@ func (m *systemNetworkModel) toAPI(ctx context.Context, diags *diag.Diagnostics)
 			Roles:             listToStringSlice(ctx, bond.Roles, diags),
 			MTU:               int(bond.MTU.ValueInt64()),
 			LLDP:              bond.LLDP.ValueBool(),
+			LLDPReceiveOnly:   bond.LLDPReceiveOnly.ValueBool(),
 			RequiredForOnline: bond.RequiredForOnline.ValueString(),
 			VLANTags:          listToIntSlice(ctx, bond.VLANTags, diags),
 			Bridge:            bridgeToAPI(bond.Bridge),
@@ -818,6 +824,7 @@ func (r *systemNetworkResource) readIntoModel(ctx context.Context, model *system
 				Roles:             stringSliceToList(ctx, iface.Roles, prev == nil || prev.Roles.IsNull(), diags),
 				MTU:               intValueOrNull(iface.MTU, prev == nil || prev.MTU.IsNull()),
 				LLDP:              boolValueOrNull(iface.LLDP, prev == nil || prev.LLDP.IsNull()),
+				LLDPReceiveOnly:   boolValueOrNull(iface.LLDPReceiveOnly, prev == nil || prev.LLDPReceiveOnly.IsNull()),
 				RequiredForOnline: stringValueOrNull(iface.RequiredForOnline, prev == nil || prev.RequiredForOnline.IsNull()),
 				StrictHwaddr:      boolValueOrNull(iface.StrictHwaddr, prev == nil || prev.StrictHwaddr.IsNull()),
 				VLANTags:          intSliceToList(ctx, iface.VLANTags, prev == nil || prev.VLANTags.IsNull(), diags),
@@ -875,6 +882,7 @@ func (r *systemNetworkResource) readIntoModel(ctx context.Context, model *system
 				Roles:             stringSliceToList(ctx, bond.Roles, prev == nil || prev.Roles.IsNull(), diags),
 				MTU:               intValueOrNull(bond.MTU, prev == nil || prev.MTU.IsNull()),
 				LLDP:              boolValueOrNull(bond.LLDP, prev == nil || prev.LLDP.IsNull()),
+				LLDPReceiveOnly:   boolValueOrNull(bond.LLDPReceiveOnly, prev == nil || prev.LLDPReceiveOnly.IsNull()),
 				RequiredForOnline: stringValueOrNull(bond.RequiredForOnline, prev == nil || prev.RequiredForOnline.IsNull()),
 				VLANTags:          intSliceToList(ctx, bond.VLANTags, prev == nil || prev.VLANTags.IsNull(), diags),
 				Options:           opts,
