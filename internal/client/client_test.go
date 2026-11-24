@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -133,5 +134,55 @@ func TestClientMTLSAndServerCertPinning(t *testing.T) {
 	_, err = c.GetApplication(context.Background(), "nonexistent")
 	if !IsNotFound(err) {
 		t.Fatalf("expected IsNotFound error, got: %v", err)
+	}
+}
+
+func TestClientUnixSocket(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "keepalive.socket")
+	lc := &net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "unix", sockPath)
+	if err != nil {
+		t.Fatalf("listening on unix socket: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/os/1.0" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"type":        "sync",
+					"status":      "Success",
+					"status_code": 200,
+					"metadata": map[string]any{
+						"environment": map[string]any{
+							"hostname":        "keepalive-node",
+							"os_name":         "IncusOS",
+							"system_is_ready": true,
+						},
+					},
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}),
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+
+	c, err := New(Config{
+		UnixSocket: sockPath,
+		PathPrefix: "/os",
+	})
+	if err != nil {
+		t.Fatalf("New unix socket client failed: %v", err)
+	}
+
+	info, err := c.GetServerInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetServerInfo via unix socket failed: %v", err)
+	}
+	if info.Environment.Hostname != "keepalive-node" {
+		t.Fatalf("unexpected hostname: %q", info.Environment.Hostname)
 	}
 }

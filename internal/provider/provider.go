@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -138,9 +139,14 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 
 	// Resolve unset connection parameters from the Incus CLI config (~/.config/incus or INCUS_CONF)
 	// when no explicit address is provided or when a remote/config_dir is explicitly selected.
+	var unixSocket string
+	hasExplicitTLS := clientCert != "" || clientKey != "" || clientCertPath != "" || clientKeyPath != ""
 	needRemoteLookup := address == "" || remoteName != "" || (!data.ConfigDir.IsNull() && !data.ConfigDir.IsUnknown())
 	if needRemoteLookup {
-		resolved, err := resolveIncusRemote(configDir, remoteName)
+		allowKeepAlive := address == "" && !hasExplicitTLS
+		needClientCert := (clientCert == "" && clientCertPath == "") || (clientKey == "" && clientKeyPath == "")
+
+		resolved, err := resolveIncusRemote(ctx, configDir, remoteName, allowKeepAlive, needClientCert)
 		if err != nil {
 			resp.Diagnostics.AddError("Failed to Resolve Incus Remote", err.Error())
 
@@ -148,14 +154,17 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 		}
 
 		if resolved != nil {
+			if allowKeepAlive && resolved.unixSocket != "" {
+				unixSocket = resolved.unixSocket
+			}
 			if address == "" {
 				address = resolved.address
 			}
 			if clientCert == "" && clientCertPath == "" {
-				clientCertPath = resolved.clientCertPath
+				clientCert = resolved.clientCert
 			}
 			if clientKey == "" && clientKeyPath == "" {
-				clientKeyPath = resolved.clientKeyPath
+				clientKey = resolved.clientKey
 			}
 			if serverCert == "" && serverCertPath == "" {
 				serverCertPath = resolved.serverCertPath
@@ -163,7 +172,7 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 		}
 	}
 
-	if address == "" {
+	if unixSocket == "" && address == "" {
 		resp.Diagnostics.AddError(
 			"Missing IncusOS Address",
 			"Configure `address` (or `INCUSOS_ADDRESS`), or specify an Incus remote via `remote` / `INCUSOS_REMOTE` / `INCUS_REMOTE`.",
@@ -208,6 +217,7 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 
 	c, err := client.New(client.Config{
 		Address:            address,
+		UnixSocket:         unixSocket,
 		PathPrefix:         pathPrefix,
 		ClientCert:         clientCert,
 		ClientKey:          clientKey,
@@ -228,14 +238,18 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 	resp.ResourceData = c
 }
 
+// promptPassphraseFunc prompts for a private key passphrase. Overridable in tests.
+var promptPassphraseFunc = promptPassphraseTTY
+
 type resolvedRemote struct {
 	address        string
-	clientCertPath string
-	clientKeyPath  string
+	unixSocket     string
+	clientCert     string
+	clientKey      string
 	serverCertPath string
 }
 
-func resolveIncusRemote(configDir, remoteName string) (*resolvedRemote, error) {
+func resolveIncusRemote(ctx context.Context, configDir, remoteName string, allowKeepAlive, needClientCert bool) (*resolvedRemote, error) {
 	configPath := ""
 	if configDir != "" {
 		expanded := configDir
@@ -259,6 +273,7 @@ func resolveIncusRemote(configDir, remoteName string) (*resolvedRemote, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading Incus CLI config: %w", err)
 	}
+	cfg.PromptPassword = promptPassphraseFunc
 
 	if remoteName == "" {
 		remoteName = cfg.DefaultRemote
@@ -286,16 +301,42 @@ func resolveIncusRemote(configDir, remoteName string) (*resolvedRemote, error) {
 		return nil, fmt.Errorf("incus remote %q has non-HTTPS address %q; IncusOS requires an HTTPS remote", remoteName, addr)
 	}
 
+	if allowKeepAlive && rem.KeepAlive > 0 {
+		socketPath := filepath.Join(cfg.ConfigDir, "keepalive", fmt.Sprintf("%s.socket", remoteName))
+		dialer := &net.Dialer{Timeout: 200 * time.Millisecond}
+		if conn, dialErr := dialer.DialContext(ctx, "unix", socketPath); dialErr == nil {
+			_ = conn.Close()
+
+			return &resolvedRemote{unixSocket: socketPath}, nil
+		}
+
+		// Keepalive proxy is not running yet; let Incus cliconfig start it
+		// (prompting via /dev/tty if the client key is passphrase-protected).
+		srv, err := cfg.GetInstanceServer(remoteName)
+		if err != nil {
+			return nil, fmt.Errorf("connecting to Incus remote %q (keepalive): %w", remoteName, err)
+		}
+		defer srv.Disconnect()
+
+		if info, infoErr := srv.GetConnectionInfo(); infoErr == nil && info.SocketPath != "" {
+			return &resolvedRemote{unixSocket: info.SocketPath}, nil
+		}
+	}
+
 	out := &resolvedRemote{
 		address: addr,
 	}
 
-	if p := cfg.ConfigPath("client.crt"); fileExists(p) {
-		out.clientCertPath = p
+	if needClientCert {
+		tlsCert, tlsKey, _, err := cfg.GetClientCertificate(remoteName)
+		if err != nil {
+			return nil, fmt.Errorf("loading client certificate for remote %q: %w", remoteName, err)
+		}
+
+		out.clientCert = tlsCert
+		out.clientKey = tlsKey
 	}
-	if p := cfg.ConfigPath("client.key"); fileExists(p) {
-		out.clientKeyPath = p
-	}
+
 	if p := cfg.ServerCertPath(remoteName); fileExists(p) {
 		out.serverCertPath = p
 	}

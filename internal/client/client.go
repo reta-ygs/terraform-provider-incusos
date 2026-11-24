@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,6 +27,9 @@ import (
 type Config struct {
 	// Address is the base HTTPS URL of the IncusOS host (e.g., https://192.0.2.10:8443).
 	Address string
+	// UnixSocket is an optional path to a local Unix domain socket (e.g., an Incus keepalive proxy socket).
+	// When set, requests are sent over this Unix socket instead of connecting directly to Address.
+	UnixSocket string
 	// PathPrefix is prepended before /1.0/... (defaults to "/os" for the Incus HTTPS proxy).
 	PathPrefix string
 	// ClientCert is the PEM-encoded client TLS certificate.
@@ -108,6 +112,34 @@ type ServerEnvironment struct {
 
 // New creates a new IncusOS API client from Config.
 func New(cfg Config) (*Client, error) {
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+
+	prefix := cfg.PathPrefix
+	if prefix != "" {
+		prefix = "/" + strings.Trim(prefix, "/")
+	}
+
+	if socketPath := strings.TrimSpace(cfg.UnixSocket); socketPath != "" {
+		dialer := &net.Dialer{Timeout: timeout}
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "unix", socketPath)
+			},
+		}
+
+		return &Client{
+			baseURL:    "http://unix.socket",
+			pathPrefix: prefix,
+			httpClient: &http.Client{
+				Transport: transport,
+				Timeout:   timeout,
+			},
+		}, nil
+	}
+
 	if strings.TrimSpace(cfg.Address) == "" {
 		return nil, errors.New("address must be set")
 	}
@@ -124,16 +156,6 @@ func New(cfg Config) (*Client, error) {
 	tlsCfg, err := buildTLSConfig(cfg)
 	if err != nil {
 		return nil, err
-	}
-
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-
-	prefix := cfg.PathPrefix
-	if prefix != "" {
-		prefix = "/" + strings.Trim(prefix, "/")
 	}
 
 	transport := &http.Transport{
