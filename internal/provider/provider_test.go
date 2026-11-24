@@ -1,6 +1,12 @@
 package provider
 
 import (
+	"context"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"golang.org/x/crypto/ssh"
 )
 
 func testAccProtoV6ProviderFactories() map[string]func() (tfprotov6.ProviderServer, error) {
@@ -469,4 +476,155 @@ data "incusos_server" "this" {}
 			},
 		},
 	})
+}
+
+func TestAccProviderIncusRemoteKeepAliveSocket(t *testing.T) {
+	confDir := t.TempDir()
+	keepaliveDir := filepath.Join(confDir, "keepalive")
+	if err := os.MkdirAll(keepaliveDir, 0o700); err != nil {
+		t.Fatalf("creating keepalive dir: %v", err)
+	}
+
+	sockPath := filepath.Join(keepaliveDir, "node-01.socket")
+	lc := &net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "unix", sockPath)
+	if err != nil {
+		t.Fatalf("listening on keepalive socket: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/os/1.0" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"type":        "sync",
+					"status":      "Success",
+					"status_code": 200,
+					"metadata": map[string]any{
+						"environment": map[string]any{
+							"hostname":        "keepalive-node-1",
+							"os_name":         "IncusOS",
+							"system_is_ready": true,
+						},
+					},
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}),
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+
+	// Write an intentionally encrypted/unparseable client.key to verify the active
+	// keepalive socket is used directly without reading or prompting for client.key.
+	if err := os.WriteFile(filepath.Join(confDir, "client.key"), []byte("-----BEGIN OPENSSH PRIVATE KEY-----\ninvalid\n-----END OPENSSH PRIVATE KEY-----\n"), 0o600); err != nil {
+		t.Fatalf("writing client.key: %v", err)
+	}
+
+	configYAML := "default-remote: node-01\nremotes:\n  node-01:\n    addr: https://192.0.2.10:8443\n    protocol: incus\n    keepalive: 300\n    public: false\n"
+	if err := os.WriteFile(filepath.Join(confDir, "config.yml"), []byte(configYAML), 0o600); err != nil {
+		t.Fatalf("writing config.yml: %v", err)
+	}
+
+	origPrompt := promptPassphraseFunc
+	t.Cleanup(func() { promptPassphraseFunc = origPrompt })
+	promptPassphraseFunc = func(filename string) (string, error) {
+		t.Fatalf("unexpected passphrase prompt for %s when keepalive socket is active", filename)
+		return "", nil
+	}
+
+	t.Setenv("INCUS_CONF", confDir)
+	t.Setenv("INCUS_REMOTE", "node-01")
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: `
+provider "incusos" {}
+
+data "incusos_server" "this" {}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("data.incusos_server.this", "hostname", "keepalive-node-1"),
+					resource.TestCheckResourceAttr("data.incusos_server.this", "os_name", "IncusOS"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccProviderIncusRemoteEncryptedOpenSSHKey(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	block, _ := pem.Decode([]byte(mock.clientKeyPEM))
+	if block == nil {
+		t.Fatal("failed to decode mock client key PEM")
+	}
+	ecKey, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		t.Fatalf("parsing EC private key: %v", err)
+	}
+
+	const passphrase = "test-secret-passphrase"
+	encBlock, err := ssh.MarshalPrivateKeyWithPassphrase(ecKey, "", []byte(passphrase))
+	if err != nil {
+		t.Fatalf("marshaling encrypted OpenSSH key: %v", err)
+	}
+	encKeyPEM := pem.EncodeToMemory(encBlock)
+
+	confDir := t.TempDir()
+	serverCertsDir := filepath.Join(confDir, "servercerts")
+	if err := os.MkdirAll(serverCertsDir, 0o700); err != nil {
+		t.Fatalf("creating servercerts dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(confDir, "client.crt"), []byte(mock.clientCertPEM), 0o600); err != nil {
+		t.Fatalf("writing client.crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "client.key"), encKeyPEM, 0o600); err != nil {
+		t.Fatalf("writing encrypted client.key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(serverCertsDir, "node-01.crt"), []byte(mock.serverCertPEM), 0o600); err != nil {
+		t.Fatalf("writing server cert: %v", err)
+	}
+
+	configYAML := "default-remote: node-01\nremotes:\n  node-01:\n    addr: " + mock.server.URL + "\n    protocol: incus\n    public: false\n"
+	if err := os.WriteFile(filepath.Join(confDir, "config.yml"), []byte(configYAML), 0o600); err != nil {
+		t.Fatalf("writing config.yml: %v", err)
+	}
+
+	promptCount := 0
+	origPrompt := promptPassphraseFunc
+	t.Cleanup(func() { promptPassphraseFunc = origPrompt })
+	promptPassphraseFunc = func(_ string) (string, error) {
+		promptCount++
+		return passphrase, nil
+	}
+
+	t.Setenv("INCUS_CONF", confDir)
+	t.Setenv("INCUS_REMOTE", "node-01")
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: `
+provider "incusos" {}
+
+data "incusos_server" "this" {}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("data.incusos_server.this", "hostname", "incusos-node-1"),
+					resource.TestCheckResourceAttr("data.incusos_server.this", "os_name", "IncusOS"),
+				),
+			},
+		},
+	})
+
+	if promptCount == 0 {
+		t.Fatal("expected passphrase prompt to be called for encrypted OpenSSH client.key")
+	}
 }
