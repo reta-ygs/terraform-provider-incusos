@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,6 +27,13 @@ import (
 type Config struct {
 	// Address is the base HTTPS URL of the IncusOS host (e.g., https://192.0.2.10:8443).
 	Address string
+	// UnixSocket is an optional path to a local Unix domain socket (e.g., an Incus keepalive proxy socket).
+	// When set, requests are sent over this Unix socket instead of connecting directly to Address.
+	UnixSocket string
+	// UnixSocketReconnect is an optional callback invoked when dialing UnixSocket fails
+	// (for example, after an Incus keepalive proxy expires due to inactivity).
+	// It returns a refreshed Unix socket path to dial before sending the HTTP request.
+	UnixSocketReconnect func(ctx context.Context) (string, error)
 	// PathPrefix is prepended before /1.0/... (defaults to "/os" for the Incus HTTPS proxy).
 	PathPrefix string
 	// ClientCert is the PEM-encoded client TLS certificate.
@@ -108,6 +116,66 @@ type ServerEnvironment struct {
 
 // New creates a new IncusOS API client from Config.
 func New(cfg Config) (*Client, error) {
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+
+	prefix := cfg.PathPrefix
+	if prefix != "" {
+		prefix = "/" + strings.Trim(prefix, "/")
+	}
+
+	if socketPath := strings.TrimSpace(cfg.UnixSocket); socketPath != "" {
+		dialer := &net.Dialer{Timeout: timeout}
+		var sockMu sync.Mutex
+		currentSocket := socketPath
+		reconnect := cfg.UnixSocketReconnect
+
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				sockMu.Lock()
+				target := currentSocket
+				sockMu.Unlock()
+
+				conn, err := dialer.DialContext(ctx, "unix", target)
+				if err == nil || reconnect == nil || ctx.Err() != nil {
+					return conn, err
+				}
+
+				sockMu.Lock()
+				defer sockMu.Unlock()
+
+				// Another goroutine may have already refreshed the proxy socket.
+				if currentSocket != target {
+					if retryConn, retryErr := dialer.DialContext(ctx, "unix", currentSocket); retryErr == nil {
+						return retryConn, nil
+					}
+				}
+
+				refreshed, reconnErr := reconnect(ctx)
+				if reconnErr != nil {
+					return nil, fmt.Errorf("dialing unix socket %q failed (%w); reconnecting keepalive proxy failed: %w", target, err, reconnErr)
+				}
+
+				if refreshed != "" {
+					currentSocket = refreshed
+				}
+
+				return dialer.DialContext(ctx, "unix", currentSocket)
+			},
+		}
+
+		return &Client{
+			baseURL:    "http://unix.socket",
+			pathPrefix: prefix,
+			httpClient: &http.Client{
+				Transport: transport,
+				Timeout:   timeout,
+			},
+		}, nil
+	}
+
 	if strings.TrimSpace(cfg.Address) == "" {
 		return nil, errors.New("address must be set")
 	}
@@ -124,16 +192,6 @@ func New(cfg Config) (*Client, error) {
 	tlsCfg, err := buildTLSConfig(cfg)
 	if err != nil {
 		return nil, err
-	}
-
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-
-	prefix := cfg.PathPrefix
-	if prefix != "" {
-		prefix = "/" + strings.Trim(prefix, "/")
 	}
 
 	transport := &http.Transport{
