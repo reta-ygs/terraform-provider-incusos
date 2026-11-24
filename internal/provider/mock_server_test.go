@@ -54,11 +54,50 @@ func newMockIncusOSServer(t *testing.T) *mockIncusOSServer {
 					"enp1s0": {
 						Addresses: []string{"192.0.2.10"},
 						Hwaddr:    "00:11:22:33:44:55",
-						MTU:       1500,
-						Roles:     []string{"management"},
-						Speed:     "1000Mb/s",
-						State:     "routable",
-						Type:      "interface",
+						LLDP: []osapi.SystemNetworkLLDPState{
+							{
+								Capabilities: []string{"bridge", "router"},
+								ChassisID:    "aa:bb:cc:dd:ee:ff",
+								Description:  "Core Switch OS 1.0",
+								Name:         "sw-core-01",
+								PortID:       "Ethernet1/1",
+								Port:         "uplink-node-01",
+								VLAN:         100,
+							},
+						},
+						MTU:   1500,
+						Roles: []string{"management"},
+						Speed: "1000Mb/s",
+						State: "routable",
+						Type:  "interface",
+					},
+					"bond0": {
+						Hwaddr: "00:11:22:33:44:66",
+						Members: map[string]osapi.SystemNetworkInterfaceState{
+							"enp2s0": {
+								Hwaddr: "00:11:22:33:44:66",
+								LLDP: []osapi.SystemNetworkLLDPState{
+									{
+										Capabilities: []string{"bridge"},
+										ChassisID:    "aa:bb:cc:dd:ee:02",
+										Description:  "Leaf Switch OS 1.0",
+										Name:         "sw-leaf-01",
+										PortID:       "Ethernet1/2",
+										Port:         "bond0-member0",
+										VLAN:         200,
+									},
+								},
+								MTU:   9000,
+								Speed: "10000Mb/s",
+								State: "enslaved",
+								Type:  "bond_member",
+							},
+						},
+						MTU:   9000,
+						Roles: []string{"instances"},
+						Speed: "10000Mb/s",
+						State: "routable",
+						Type:  "bond",
 					},
 				},
 			},
@@ -366,6 +405,19 @@ func (m *mockIncusOSServer) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		var req osapi.SystemPower
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Config.Screen != nil {
+			if req.Config.Screen.BlankTimeout < 0 || req.Config.Screen.BlankTimeout > 60 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"type":       "error",
+					"error":      "screen blank timeout must be between 0 and 60 minutes",
+					"error_code": http.StatusBadRequest,
+				})
+				return
+			}
+			m.power.State.Screen.BlankTimeout = req.Config.Screen.BlankTimeout
+		}
 		m.power.Config = req.Config
 		writeSync(w, map[string]any{})
 	case "/1.0/system/provider":

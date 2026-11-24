@@ -30,6 +30,7 @@ type systemPowerModel struct {
 	CPUScalingDriver               types.String `tfsdk:"cpu_scaling_driver"`
 	CPUAvailableGovernors          types.List   `tfsdk:"cpu_available_governors"`
 	CPUAvailablePreferences        types.List   `tfsdk:"cpu_available_preferences"`
+	ScreenBlankTimeout             types.Int64  `tfsdk:"screen_blank_timeout"`
 }
 
 func NewSystemPowerResource() resource.Resource {
@@ -71,6 +72,10 @@ func (r *systemPowerResource) Schema(_ context.Context, _ resource.SchemaRequest
 				MarkdownDescription: "Available CPU energy performance preferences reported by the host.",
 				ElementType:         types.StringType,
 				Computed:            true,
+			},
+			"screen_blank_timeout": schema.Int64Attribute{
+				MarkdownDescription: "Console screen blanking timeout in minutes without keyboard input (0 to 60; 0 disables blanking).",
+				Optional:            true,
 			},
 		},
 	}
@@ -156,6 +161,12 @@ func (m *systemPowerModel) toAPI() osapi.SystemPower {
 		}
 	}
 
+	if !m.ScreenBlankTimeout.IsNull() {
+		out.Config.Screen = &osapi.SystemPowerConfigScreen{
+			BlankTimeout: int(m.ScreenBlankTimeout.ValueInt64()),
+		}
+	}
+
 	return out
 }
 
@@ -174,6 +185,12 @@ func (r *systemPowerResource) readIntoModel(ctx context.Context, model *systemPo
 	} else {
 		model.CPUScalingGovernor = types.StringNull()
 		model.CPUEnergyPerformancePreference = types.StringNull()
+	}
+
+	if res.Config.Screen != nil {
+		model.ScreenBlankTimeout = types.Int64Value(int64(res.Config.Screen.BlankTimeout))
+	} else {
+		model.ScreenBlankTimeout = types.Int64Null()
 	}
 
 	model.CPUScalingDriver = types.StringValue(res.State.CPU.ScalingDriver)

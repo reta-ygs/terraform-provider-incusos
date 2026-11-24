@@ -5,7 +5,9 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	osapi "github.com/lxc/incus-os/incus-osd/api"
 
 	"github.com/reta-ygs/terraform-provider-incusos/internal/client"
 )
@@ -321,14 +323,71 @@ type systemNetworkDataSourceModel struct {
 	Interfaces             map[string]systemNetworkInterfaceStateDataObj `tfsdk:"interfaces"`
 }
 
+type systemNetworkLLDPStateDataObj struct {
+	Capabilities types.List   `tfsdk:"capabilities"`
+	ChassisID    types.String `tfsdk:"chassis_id"`
+	Description  types.String `tfsdk:"description"`
+	Name         types.String `tfsdk:"name"`
+	PortID       types.String `tfsdk:"port_id"`
+	Port         types.String `tfsdk:"port"`
+	VLAN         types.Int64  `tfsdk:"vlan"`
+}
+
+type systemNetworkInterfaceMemberStateDataObj struct {
+	Addresses types.List                      `tfsdk:"addresses"`
+	Hwaddr    types.String                    `tfsdk:"hwaddr"`
+	LLDP      []systemNetworkLLDPStateDataObj `tfsdk:"lldp"`
+	MTU       types.Int64                     `tfsdk:"mtu"`
+	Roles     types.List                      `tfsdk:"roles"`
+	Speed     types.String                    `tfsdk:"speed"`
+	State     types.String                    `tfsdk:"state"`
+	Type      types.String                    `tfsdk:"type"`
+}
+
 type systemNetworkInterfaceStateDataObj struct {
-	Addresses types.List   `tfsdk:"addresses"`
-	Hwaddr    types.String `tfsdk:"hwaddr"`
-	MTU       types.Int64  `tfsdk:"mtu"`
-	Roles     types.List   `tfsdk:"roles"`
-	Speed     types.String `tfsdk:"speed"`
-	State     types.String `tfsdk:"state"`
-	Type      types.String `tfsdk:"type"`
+	Addresses types.List                                          `tfsdk:"addresses"`
+	Hwaddr    types.String                                        `tfsdk:"hwaddr"`
+	LLDP      []systemNetworkLLDPStateDataObj                     `tfsdk:"lldp"`
+	Members   map[string]systemNetworkInterfaceMemberStateDataObj `tfsdk:"members"`
+	MTU       types.Int64                                         `tfsdk:"mtu"`
+	Roles     types.List                                          `tfsdk:"roles"`
+	Speed     types.String                                        `tfsdk:"speed"`
+	State     types.String                                        `tfsdk:"state"`
+	Type      types.String                                        `tfsdk:"type"`
+}
+
+func systemNetworkLLDPStateAttr() schema.ListNestedAttribute {
+	return schema.ListNestedAttribute{
+		Computed: true,
+		NestedObject: schema.NestedAttributeObject{
+			Attributes: map[string]schema.Attribute{
+				"capabilities": schema.ListAttribute{ElementType: types.StringType, Computed: true},
+				"chassis_id":   schema.StringAttribute{Computed: true},
+				"description":  schema.StringAttribute{Computed: true},
+				"name":         schema.StringAttribute{Computed: true},
+				"port_id":      schema.StringAttribute{Computed: true},
+				"port":         schema.StringAttribute{Computed: true},
+				"vlan":         schema.Int64Attribute{Computed: true},
+			},
+		},
+	}
+}
+
+func lldpStateFromAPI(ctx context.Context, in []osapi.SystemNetworkLLDPState, diags *diag.Diagnostics) []systemNetworkLLDPStateDataObj {
+	out := make([]systemNetworkLLDPStateDataObj, 0, len(in))
+	for _, n := range in {
+		out = append(out, systemNetworkLLDPStateDataObj{
+			Capabilities: stringSliceToList(ctx, n.Capabilities, false, diags),
+			ChassisID:    types.StringValue(n.ChassisID),
+			Description:  types.StringValue(n.Description),
+			Name:         types.StringValue(n.Name),
+			PortID:       types.StringValue(n.PortID),
+			Port:         types.StringValue(n.Port),
+			VLAN:         types.Int64Value(int64(n.VLAN)),
+		})
+	}
+
+	return out
 }
 
 func NewSystemNetworkDataSource() datasource.DataSource { return &systemNetworkDataSource{} }
@@ -349,11 +408,27 @@ func (d *systemNetworkDataSource) Schema(_ context.Context, _ datasource.SchemaR
 					Attributes: map[string]schema.Attribute{
 						"addresses": schema.ListAttribute{ElementType: types.StringType, Computed: true},
 						"hwaddr":    schema.StringAttribute{Computed: true},
-						"mtu":       schema.Int64Attribute{Computed: true},
-						"roles":     schema.ListAttribute{ElementType: types.StringType, Computed: true},
-						"speed":     schema.StringAttribute{Computed: true},
-						"state":     schema.StringAttribute{Computed: true},
-						"type":      schema.StringAttribute{Computed: true},
+						"lldp":      systemNetworkLLDPStateAttr(),
+						"members": schema.MapNestedAttribute{
+							Computed: true,
+							NestedObject: schema.NestedAttributeObject{
+								Attributes: map[string]schema.Attribute{
+									"addresses": schema.ListAttribute{ElementType: types.StringType, Computed: true},
+									"hwaddr":    schema.StringAttribute{Computed: true},
+									"lldp":      systemNetworkLLDPStateAttr(),
+									"mtu":       schema.Int64Attribute{Computed: true},
+									"roles":     schema.ListAttribute{ElementType: types.StringType, Computed: true},
+									"speed":     schema.StringAttribute{Computed: true},
+									"state":     schema.StringAttribute{Computed: true},
+									"type":      schema.StringAttribute{Computed: true},
+								},
+							},
+						},
+						"mtu":   schema.Int64Attribute{Computed: true},
+						"roles": schema.ListAttribute{ElementType: types.StringType, Computed: true},
+						"speed": schema.StringAttribute{Computed: true},
+						"state": schema.StringAttribute{Computed: true},
+						"type":  schema.StringAttribute{Computed: true},
 					},
 				},
 			},
@@ -374,9 +449,25 @@ func (d *systemNetworkDataSource) Read(ctx context.Context, _ datasource.ReadReq
 
 	ifaces := make(map[string]systemNetworkInterfaceStateDataObj, len(res.State.Interfaces))
 	for name, st := range res.State.Interfaces {
+		members := make(map[string]systemNetworkInterfaceMemberStateDataObj, len(st.Members))
+		for memberName, mst := range st.Members {
+			members[memberName] = systemNetworkInterfaceMemberStateDataObj{
+				Addresses: stringSliceToList(ctx, mst.Addresses, false, &resp.Diagnostics),
+				Hwaddr:    types.StringValue(mst.Hwaddr),
+				LLDP:      lldpStateFromAPI(ctx, mst.LLDP, &resp.Diagnostics),
+				MTU:       types.Int64Value(int64(mst.MTU)),
+				Roles:     stringSliceToList(ctx, mst.Roles, false, &resp.Diagnostics),
+				Speed:     types.StringValue(mst.Speed),
+				State:     types.StringValue(mst.State),
+				Type:      types.StringValue(mst.Type),
+			}
+		}
+
 		ifaces[name] = systemNetworkInterfaceStateDataObj{
 			Addresses: stringSliceToList(ctx, st.Addresses, false, &resp.Diagnostics),
 			Hwaddr:    types.StringValue(st.Hwaddr),
+			LLDP:      lldpStateFromAPI(ctx, st.LLDP, &resp.Diagnostics),
+			Members:   members,
 			MTU:       types.Int64Value(int64(st.MTU)),
 			Roles:     stringSliceToList(ctx, st.Roles, false, &resp.Diagnostics),
 			Speed:     types.StringValue(st.Speed),

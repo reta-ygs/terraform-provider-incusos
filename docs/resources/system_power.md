@@ -19,6 +19,7 @@ Manages IncusOS system power management configuration (`/1.0/system/power`).
 
 - `cpu_energy_performance_preference` (String) CPU energy performance preference (e.g., `balance_performance`, `power`).
 - `cpu_scaling_governor` (String) CPU frequency scaling governor (e.g., `performance`, `powersave`).
+- `screen_blank_timeout` (Number) Console screen blanking timeout in minutes without keyboard input (0 to 60; 0 disables blanking).
 
 ### Read-Only
 
