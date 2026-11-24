@@ -186,3 +186,64 @@ func TestClientUnixSocket(t *testing.T) {
 		t.Fatalf("unexpected hostname: %q", info.Environment.Hostname)
 	}
 }
+
+func TestClientUnixSocketReconnect(t *testing.T) {
+	dir := t.TempDir()
+	staleSock := filepath.Join(dir, "stale.socket")
+	freshSock := filepath.Join(dir, "fresh.socket")
+
+	lc := &net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "unix", freshSock)
+	if err != nil {
+		t.Fatalf("listening on fresh unix socket: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/os/1.0" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"type":        "sync",
+					"status":      "Success",
+					"status_code": 200,
+					"metadata": map[string]any{
+						"environment": map[string]any{
+							"hostname":        "reconnected-node",
+							"os_name":         "IncusOS",
+							"system_is_ready": true,
+						},
+					},
+				})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}),
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+
+	reconnected := false
+	c, err := New(Config{
+		UnixSocket: staleSock,
+		UnixSocketReconnect: func(_ context.Context) (string, error) {
+			reconnected = true
+			return freshSock, nil
+		},
+		PathPrefix: "/os",
+	})
+	if err != nil {
+		t.Fatalf("New unix socket client failed: %v", err)
+	}
+
+	info, err := c.GetServerInfo(context.Background())
+	if err != nil {
+		t.Fatalf("GetServerInfo after reconnect failed: %v", err)
+	}
+	if !reconnected {
+		t.Fatal("expected UnixSocketReconnect callback to be invoked")
+	}
+	if info.Environment.Hostname != "reconnected-node" {
+		t.Fatalf("unexpected hostname: %q", info.Environment.Hostname)
+	}
+}

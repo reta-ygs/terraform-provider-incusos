@@ -30,6 +30,10 @@ type Config struct {
 	// UnixSocket is an optional path to a local Unix domain socket (e.g., an Incus keepalive proxy socket).
 	// When set, requests are sent over this Unix socket instead of connecting directly to Address.
 	UnixSocket string
+	// UnixSocketReconnect is an optional callback invoked when dialing UnixSocket fails
+	// (for example, after an Incus keepalive proxy expires due to inactivity).
+	// It returns a refreshed Unix socket path to dial before sending the HTTP request.
+	UnixSocketReconnect func(ctx context.Context) (string, error)
 	// PathPrefix is prepended before /1.0/... (defaults to "/os" for the Incus HTTPS proxy).
 	PathPrefix string
 	// ClientCert is the PEM-encoded client TLS certificate.
@@ -124,9 +128,41 @@ func New(cfg Config) (*Client, error) {
 
 	if socketPath := strings.TrimSpace(cfg.UnixSocket); socketPath != "" {
 		dialer := &net.Dialer{Timeout: timeout}
+		var sockMu sync.Mutex
+		currentSocket := socketPath
+		reconnect := cfg.UnixSocketReconnect
+
 		transport := &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialer.DialContext(ctx, "unix", socketPath)
+				sockMu.Lock()
+				target := currentSocket
+				sockMu.Unlock()
+
+				conn, err := dialer.DialContext(ctx, "unix", target)
+				if err == nil || reconnect == nil || ctx.Err() != nil {
+					return conn, err
+				}
+
+				sockMu.Lock()
+				defer sockMu.Unlock()
+
+				// Another goroutine may have already refreshed the proxy socket.
+				if currentSocket != target {
+					if retryConn, retryErr := dialer.DialContext(ctx, "unix", currentSocket); retryErr == nil {
+						return retryConn, nil
+					}
+				}
+
+				refreshed, reconnErr := reconnect(ctx)
+				if reconnErr != nil {
+					return nil, fmt.Errorf("dialing unix socket %q failed (%w); reconnecting keepalive proxy failed: %w", target, err, reconnErr)
+				}
+
+				if refreshed != "" {
+					currentSocket = refreshed
+				}
+
+				return dialer.DialContext(ctx, "unix", currentSocket)
 			},
 		}
 

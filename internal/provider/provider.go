@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	incus "github.com/lxc/incus/v7/client"
 	"github.com/lxc/incus/v7/shared/cliconfig"
 
 	"github.com/reta-ygs/terraform-provider-incusos/internal/client"
@@ -140,13 +141,18 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 	// Resolve unset connection parameters from the Incus CLI config (~/.config/incus or INCUS_CONF)
 	// when no explicit address is provided or when a remote/config_dir is explicitly selected.
 	var unixSocket string
-	hasExplicitTLS := clientCert != "" || clientKey != "" || clientCertPath != "" || clientKeyPath != ""
-	needRemoteLookup := address == "" || remoteName != "" || (!data.ConfigDir.IsNull() && !data.ConfigDir.IsUnknown())
+	var unixSocketReconnect func(context.Context) (string, error)
+	hasExplicitInsecure := (!data.InsecureSkipVerify.IsNull() && !data.InsecureSkipVerify.IsUnknown()) || os.Getenv("INCUSOS_INSECURE_SKIP_VERIFY") != ""
+	hasExplicitTLS := clientCert != "" || clientKey != "" || clientCertPath != "" || clientKeyPath != "" || serverCert != "" || serverCertPath != "" || hasExplicitInsecure
+	hasExplicitConfigDir := !data.ConfigDir.IsNull() && !data.ConfigDir.IsUnknown()
+	needRemoteLookup := address == "" || remoteName != "" || hasExplicitConfigDir
 	if needRemoteLookup {
 		allowKeepAlive := address == "" && !hasExplicitTLS
-		needClientCert := (clientCert == "" && clientCertPath == "") || (clientKey == "" && clientKeyPath == "")
+		canSpawnKeepAlive := allowKeepAlive && !hasExplicitConfigDir
+		needClientCert := clientCert == "" && clientCertPath == ""
+		needClientKey := clientKey == "" && clientKeyPath == ""
 
-		resolved, err := resolveIncusRemote(ctx, configDir, remoteName, allowKeepAlive, needClientCert)
+		resolved, err := resolveIncusRemote(ctx, configDir, remoteName, allowKeepAlive, canSpawnKeepAlive, needClientCert, needClientKey)
 		if err != nil {
 			resp.Diagnostics.AddError("Failed to Resolve Incus Remote", err.Error())
 
@@ -156,14 +162,16 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 		if resolved != nil {
 			if allowKeepAlive && resolved.unixSocket != "" {
 				unixSocket = resolved.unixSocket
+				unixSocketReconnect = resolved.unixSocketReconnect
 			}
 			if address == "" {
 				address = resolved.address
 			}
-			if clientCert == "" && clientCertPath == "" {
+			if needClientCert {
 				clientCert = resolved.clientCert
+				clientCertPath = resolved.clientCertPath
 			}
-			if clientKey == "" && clientKeyPath == "" {
+			if needClientKey {
 				clientKey = resolved.clientKey
 			}
 			if serverCert == "" && serverCertPath == "" {
@@ -216,17 +224,18 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 	}
 
 	c, err := client.New(client.Config{
-		Address:            address,
-		UnixSocket:         unixSocket,
-		PathPrefix:         pathPrefix,
-		ClientCert:         clientCert,
-		ClientKey:          clientKey,
-		ClientCertPath:     clientCertPath,
-		ClientKeyPath:      clientKeyPath,
-		ServerCert:         serverCert,
-		ServerCertPath:     serverCertPath,
-		InsecureSkipVerify: insecure,
-		Timeout:            timeout,
+		Address:             address,
+		UnixSocket:          unixSocket,
+		UnixSocketReconnect: unixSocketReconnect,
+		PathPrefix:          pathPrefix,
+		ClientCert:          clientCert,
+		ClientKey:           clientKey,
+		ClientCertPath:      clientCertPath,
+		ClientKeyPath:       clientKeyPath,
+		ServerCert:          serverCert,
+		ServerCertPath:      serverCertPath,
+		InsecureSkipVerify:  insecure,
+		Timeout:             timeout,
 	})
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to Create IncusOS Client", err.Error())
@@ -242,14 +251,52 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 var promptPassphraseFunc = promptPassphraseTTY
 
 type resolvedRemote struct {
-	address        string
-	unixSocket     string
-	clientCert     string
-	clientKey      string
-	serverCertPath string
+	address             string
+	unixSocket          string
+	unixSocketReconnect func(context.Context) (string, error)
+	clientCert          string
+	clientCertPath      string
+	clientKey           string
+	serverCertPath      string
 }
 
-func resolveIncusRemote(ctx context.Context, configDir, remoteName string, allowKeepAlive, needClientCert bool) (*resolvedRemote, error) {
+func startKeepAliveProxy(ctx context.Context, cfg *cliconfig.Config, remoteName string) (string, error) {
+	type result struct {
+		srv incus.InstanceServer
+		err error
+	}
+
+	ch := make(chan result, 1)
+	go func() {
+		srv, err := cfg.GetInstanceServer(remoteName)
+		ch <- result{srv: srv, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		go func() {
+			if res := <-ch; res.srv != nil {
+				res.srv.Disconnect()
+			}
+		}()
+
+		return "", ctx.Err()
+	case res := <-ch:
+		if res.err != nil {
+			return "", res.err
+		}
+		defer res.srv.Disconnect()
+
+		info, err := res.srv.GetConnectionInfo()
+		if err != nil {
+			return "", err
+		}
+
+		return info.SocketPath, nil
+	}
+}
+
+func resolveIncusRemote(ctx context.Context, configDir, remoteName string, allowKeepAlive, canSpawnKeepAlive, needClientCert, needClientKey bool) (*resolvedRemote, error) {
 	configPath := ""
 	if configDir != "" {
 		expanded := configDir
@@ -302,24 +349,46 @@ func resolveIncusRemote(ctx context.Context, configDir, remoteName string, allow
 	}
 
 	if allowKeepAlive && rem.KeepAlive > 0 {
+		var reconnect func(context.Context) (string, error)
+		if canSpawnKeepAlive {
+			reconnect = func(reconnCtx context.Context) (string, error) {
+				sock, reconnErr := startKeepAliveProxy(reconnCtx, cfg, remoteName)
+				if reconnErr != nil {
+					return "", reconnErr
+				}
+				if sock == "" {
+					return "", fmt.Errorf("incus keepalive proxy for remote %q did not expose a unix socket", remoteName)
+				}
+
+				return sock, nil
+			}
+		}
+
 		socketPath := filepath.Join(cfg.ConfigDir, "keepalive", fmt.Sprintf("%s.socket", remoteName))
 		dialer := &net.Dialer{Timeout: 200 * time.Millisecond}
 		if conn, dialErr := dialer.DialContext(ctx, "unix", socketPath); dialErr == nil {
 			_ = conn.Close()
 
-			return &resolvedRemote{unixSocket: socketPath}, nil
+			return &resolvedRemote{
+				unixSocket:          socketPath,
+				unixSocketReconnect: reconnect,
+			}, nil
 		}
 
-		// Keepalive proxy is not running yet; let Incus cliconfig start it
-		// (prompting via /dev/tty if the client key is passphrase-protected).
-		srv, err := cfg.GetInstanceServer(remoteName)
-		if err != nil {
-			return nil, fmt.Errorf("connecting to Incus remote %q (keepalive): %w", remoteName, err)
-		}
-		defer srv.Disconnect()
+		// Keepalive proxy is not running yet; start it when using the standard/INCUS_CONF config dir
+		// (since Incus cliconfig spawns `incus remote proxy` inheriting INCUS_CONF).
+		if canSpawnKeepAlive {
+			sock, startErr := startKeepAliveProxy(ctx, cfg, remoteName)
+			if startErr != nil {
+				return nil, fmt.Errorf("connecting to Incus remote %q (keepalive): %w", remoteName, startErr)
+			}
 
-		if info, infoErr := srv.GetConnectionInfo(); infoErr == nil && info.SocketPath != "" {
-			return &resolvedRemote{unixSocket: info.SocketPath}, nil
+			if sock != "" {
+				return &resolvedRemote{
+					unixSocket:          sock,
+					unixSocketReconnect: reconnect,
+				}, nil
+			}
 		}
 	}
 
@@ -327,14 +396,24 @@ func resolveIncusRemote(ctx context.Context, configDir, remoteName string, allow
 		address: addr,
 	}
 
-	if needClientCert {
+	if needClientKey {
 		tlsCert, tlsKey, _, err := cfg.GetClientCertificate(remoteName)
 		if err != nil {
 			return nil, fmt.Errorf("loading client certificate for remote %q: %w", remoteName, err)
 		}
 
-		out.clientCert = tlsCert
+		if needClientCert {
+			out.clientCert = tlsCert
+		}
 		out.clientKey = tlsKey
+	} else if needClientCert {
+		certPath := cfg.ConfigPath("client.crt")
+		if cfg.HasRemoteClientCertificate(remoteName) {
+			certPath = cfg.ConfigPath("clientcerts", fmt.Sprintf("%s.crt", remoteName))
+		}
+		if fileExists(certPath) {
+			out.clientCertPath = certPath
+		}
 	}
 
 	if p := cfg.ServerCertPath(remoteName); fileExists(p) {
