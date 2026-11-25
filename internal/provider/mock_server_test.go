@@ -28,19 +28,23 @@ type mockIncusOSServer struct {
 	clientCertPEM string
 	clientKeyPEM  string
 
-	mu               sync.Mutex
-	network          osapi.SystemNetwork
-	networkConfirmed bool
-	storage          osapi.SystemStorage
-	kernel           osapi.SystemKernel
-	logging          osapi.SystemLogging
-	power            osapi.SystemPower
-	provider         osapi.SystemProvider
-	security         osapi.SystemSecurity
-	update           osapi.SystemUpdate
-	fallback         osapi.SystemFallbackListener
-	applications     map[string]osapi.Application
-	services         map[string]json.RawMessage
+	mu                             sync.Mutex
+	network                        osapi.SystemNetwork
+	networkPending                 bool
+	networkConfirmed               bool
+	networkConfirmCount            int
+	networkConfirmFailCount        int
+	lastNetworkConfirmationTimeout string
+	storage                        osapi.SystemStorage
+	kernel                         osapi.SystemKernel
+	logging                        osapi.SystemLogging
+	power                          osapi.SystemPower
+	provider                       osapi.SystemProvider
+	security                       osapi.SystemSecurity
+	update                         osapi.SystemUpdate
+	fallback                       osapi.SystemFallbackListener
+	applications                   map[string]osapi.Application
+	services                       map[string]json.RawMessage
 }
 
 func newMockIncusOSServer(t *testing.T) *mockIncusOSServer {
@@ -236,6 +240,10 @@ func newMockIncusOSServer(t *testing.T) *mockIncusOSServer {
 }
 
 func (m *mockIncusOSServer) providerBlock() string {
+	return m.providerBlockWithExtra("")
+}
+
+func (m *mockIncusOSServer) providerBlockWithExtra(extra string) string {
 	return `
 provider "incusos" {
   address     = "` + m.server.URL + `"
@@ -246,7 +254,7 @@ provider "incusos" {
 ` + m.clientKeyPEM + `EOT
   server_cert = <<EOT
 ` + m.serverCertPEM + `EOT
-}
+` + extra + `}
 `
 }
 
@@ -260,14 +268,18 @@ func writeSync(w http.ResponseWriter, metadata any) {
 	})
 }
 
-func writeNotFound(w http.ResponseWriter, msg string) {
+func writeError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotFound)
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"type":       "error",
 		"error":      msg,
-		"error_code": http.StatusNotFound,
+		"error_code": status,
 	})
+}
+
+func writeNotFound(w http.ResponseWriter, msg string) {
+	writeError(w, http.StatusNotFound, msg)
 }
 
 func (m *mockIncusOSServer) handle(w http.ResponseWriter, r *http.Request) {
@@ -295,12 +307,52 @@ func (m *mockIncusOSServer) handle(w http.ResponseWriter, r *http.Request) {
 			writeSync(w, m.network)
 			return
 		}
+		if m.networkPending {
+			writeError(w, http.StatusBadRequest, "a pending network configuration must first be confirmed before a new configuration can be applied")
+			return
+		}
 		var req osapi.SystemNetwork
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Config == nil {
+			req.Config = &osapi.SystemNetworkConfig{}
+		}
+
+		// Emulate incus-osd api_system_network.go confirmation timeout semantics.
+		confirmTimeout := req.Config.ConfirmationTimeout
+		m.lastNetworkConfirmationTimeout = confirmTimeout
+		if confirmTimeout != "" {
+			d, err := time.ParseDuration(confirmTimeout)
+			if err != nil || d <= 0 {
+				writeError(w, http.StatusBadRequest, "invalid confirmation timeout provided")
+				return
+			}
+			// IncusOS clears ConfirmationTimeout after parsing so GET never returns it.
+			req.Config.ConfirmationTimeout = ""
+		}
+
+		if confirmTimeout == "" && m.network.Config != nil && m.network.Config.DefaultConfirmationTimeout != "" {
+			confirmTimeout = m.network.Config.DefaultConfirmationTimeout
+		}
+
+		if confirmTimeout != "" {
+			m.networkPending = true
+		}
+
 		m.network.Config = req.Config
 		writeSync(w, map[string]any{})
 	case "/1.0/system/network/:confirm":
+		if m.networkConfirmFailCount > 0 {
+			m.networkConfirmFailCount--
+			writeError(w, http.StatusServiceUnavailable, "temporary network disruption")
+			return
+		}
+		if !m.networkPending {
+			writeError(w, http.StatusBadRequest, "no network configuration is pending a confirmation")
+			return
+		}
+		m.networkPending = false
 		m.networkConfirmed = true
+		m.networkConfirmCount++
 		writeSync(w, map[string]any{})
 	case "/1.0/system/storage":
 		if r.Method == http.MethodGet {

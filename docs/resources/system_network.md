@@ -17,10 +17,10 @@ Manages IncusOS host network configuration (`/1.0/system/network`), including DN
 
 ### Optional
 
-- `auto_confirm` (Boolean) Automatically call `POST /1.0/system/network/:confirm` after applying changes when a confirmation timeout is configured.
+- `auto_confirm` (Boolean) Automatically call `POST /1.0/system/network/:confirm` (with retry) after applying changes when a confirmation is pending. Defaults to `true`.
 - `bonds` (Attributes List) (see [below for nested schema](#nestedatt--bonds))
-- `confirmation_timeout` (String) Optional rollback timeout duration (e.g., `60s`) if network changes are not confirmed.
-- `default_confirmation_timeout` (String) Default rollback timeout duration when `confirmation_timeout` is not specified.
+- `confirmation_timeout` (String) Optional per-resource rollback timeout duration (e.g., `60s`, `2m`) overriding the provider's `network_confirmation_timeout`. Set to `0` or `0s` to disable sending a confirmation timeout on apply.
+- `default_confirmation_timeout` (String) Persistent OS-level default rollback timeout duration stored on IncusOS for network changes that do not specify `confirmation_timeout`.
 - `dns` (Attributes) (see [below for nested schema](#nestedatt--dns))
 - `ignore_service_checks` (Boolean) Skip waiting for DNS and NTP availability when bringing up the network.
 - `interfaces` (Attributes List) (see [below for nested schema](#nestedatt--interfaces))

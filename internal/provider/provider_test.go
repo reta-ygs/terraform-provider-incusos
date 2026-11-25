@@ -628,3 +628,239 @@ data "incusos_server" "this" {}
 		t.Fatal("expected passphrase prompt to be called for encrypted OpenSSH client.key")
 	}
 }
+
+func TestAccSystemNetworkDefaultProviderConfirmationTimeout(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_network" "this" {
+  dns = {
+    hostname = "node-01"
+  }
+  interfaces = [
+    {
+      name      = "enp1s0"
+      hwaddr    = "00:11:22:33:44:55"
+      addresses = ["192.0.2.10/24"]
+      roles     = ["management"]
+    }
+  ]
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("incusos_system_network.this", "dns.hostname", "node-01"),
+					resource.TestCheckResourceAttr("incusos_system_network.this", "auto_confirm", "true"),
+					resource.TestCheckNoResourceAttr("incusos_system_network.this", "confirmation_timeout"),
+				),
+			},
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_network" "this" {
+  confirmation_timeout = "45s"
+
+  dns = {
+    hostname = "node-02"
+  }
+  interfaces = [
+    {
+      name      = "enp1s0"
+      hwaddr    = "00:11:22:33:44:55"
+      addresses = ["192.0.2.10/24"]
+      roles     = ["management"]
+    }
+  ]
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("incusos_system_network.this", "dns.hostname", "node-02"),
+					resource.TestCheckResourceAttr("incusos_system_network.this", "confirmation_timeout", "45s"),
+				),
+			},
+		},
+	})
+
+	if mock.lastNetworkConfirmationTimeout != "45s" {
+		t.Fatalf("expected last confirmation_timeout to be 45s, got %q", mock.lastNetworkConfirmationTimeout)
+	}
+	if mock.networkConfirmCount != 2 {
+		t.Fatalf("expected 2 network confirmations, got %d", mock.networkConfirmCount)
+	}
+	if mock.networkPending {
+		t.Fatalf("expected network configuration not to remain pending")
+	}
+}
+
+func TestAccSystemNetworkConfirmationRetry(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+	mock.networkConfirmFailCount = 2
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_network" "this" {
+  dns = {
+    hostname = "node-retry"
+  }
+  interfaces = [
+    {
+      name      = "enp1s0"
+      hwaddr    = "00:11:22:33:44:55"
+      addresses = ["192.0.2.10/24"]
+      roles     = ["management"]
+    }
+  ]
+}
+`,
+				Check: resource.TestCheckResourceAttr("incusos_system_network.this", "dns.hostname", "node-retry"),
+			},
+		},
+	})
+
+	if mock.networkConfirmCount != 1 {
+		t.Fatalf("expected 1 successful confirmation after retries, got %d", mock.networkConfirmCount)
+	}
+	if mock.networkPending {
+		t.Fatalf("expected network configuration not to remain pending")
+	}
+}
+
+func TestAccSystemNetworkDisableConfirmationAndDefaultConfirmationTimeout(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				// First apply sets default_confirmation_timeout while provider confirmation is disabled (0).
+				// IncusOS does NOT enter pending state on this first PUT because the prior running config had none.
+				Config: mock.providerBlockWithExtra("  network_confirmation_timeout = \"0\"\n") + `
+resource "incusos_system_network" "this" {
+  default_confirmation_timeout = "30s"
+
+  dns = {
+    hostname = "node-01"
+  }
+  interfaces = [
+    {
+      name      = "enp1s0"
+      hwaddr    = "00:11:22:33:44:55"
+      addresses = ["192.0.2.10/24"]
+      roles     = ["management"]
+    }
+  ]
+}
+`,
+				Check: resource.TestCheckResourceAttr("incusos_system_network.this", "default_confirmation_timeout", "30s"),
+			},
+			{
+				// Second apply: prior running config now has default_confirmation_timeout = "30s",
+				// so IncusOS enters pending state even though confirmation_timeout is omitted,
+				// and the provider must still confirm it.
+				Config: mock.providerBlockWithExtra("  network_confirmation_timeout = \"0\"\n") + `
+resource "incusos_system_network" "this" {
+  default_confirmation_timeout = "30s"
+
+  dns = {
+    hostname = "node-02"
+  }
+  interfaces = [
+    {
+      name      = "enp1s0"
+      hwaddr    = "00:11:22:33:44:55"
+      addresses = ["192.0.2.10/24"]
+      roles     = ["management"]
+    }
+  ]
+}
+`,
+				Check: resource.TestCheckResourceAttr("incusos_system_network.this", "dns.hostname", "node-02"),
+			},
+		},
+	})
+
+	if mock.networkConfirmCount != 1 {
+		t.Fatalf("expected exactly 1 confirmation (on second apply only), got %d", mock.networkConfirmCount)
+	}
+	if mock.networkPending {
+		t.Fatalf("expected network configuration not to remain pending")
+	}
+}
+
+func TestAccSystemNetworkAutoConfirmFalse(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_network" "this" {
+  auto_confirm = false
+
+  dns = {
+    hostname = "node-manual"
+  }
+  interfaces = [
+    {
+      name      = "enp1s0"
+      hwaddr    = "00:11:22:33:44:55"
+      addresses = ["192.0.2.10/24"]
+      roles     = ["management"]
+    }
+  ]
+}
+`,
+				Check: resource.TestCheckResourceAttr("incusos_system_network.this", "auto_confirm", "false"),
+			},
+		},
+	})
+
+	if mock.networkConfirmCount != 0 {
+		t.Fatalf("expected 0 confirmations when auto_confirm=false, got %d", mock.networkConfirmCount)
+	}
+	if !mock.networkPending {
+		t.Fatalf("expected network configuration to remain pending when auto_confirm=false")
+	}
+}
+
+func TestAccSystemNetworkConfirmationTimeoutEnvVar(t *testing.T) {
+	mock := newMockIncusOSServer(t)
+	t.Setenv("INCUSOS_NETWORK_CONFIRMATION_TIMEOUT", "90s")
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: mock.providerBlock() + `
+resource "incusos_system_network" "this" {
+  dns = {
+    hostname = "node-env"
+  }
+  interfaces = [
+    {
+      name      = "enp1s0"
+      hwaddr    = "00:11:22:33:44:55"
+      addresses = ["192.0.2.10/24"]
+      roles     = ["management"]
+    }
+  ]
+}
+`,
+				Check: resource.TestCheckResourceAttr("incusos_system_network.this", "dns.hostname", "node-env"),
+			},
+		},
+	})
+
+	if mock.lastNetworkConfirmationTimeout != "1m30s" {
+		t.Fatalf("expected confirmation_timeout 1m30s from env var, got %q", mock.lastNetworkConfirmationTimeout)
+	}
+	if mock.networkConfirmCount != 1 {
+		t.Fatalf("expected 1 confirmation, got %d", mock.networkConfirmCount)
+	}
+}

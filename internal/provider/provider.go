@@ -23,6 +23,8 @@ import (
 
 var _ provider.Provider = (*IncusOSProvider)(nil)
 
+const defaultNetworkConfirmationTimeout = 60 * time.Second
+
 // IncusOSProvider defines the Terraform provider implementation for IncusOS.
 type IncusOSProvider struct {
 	version string
@@ -30,18 +32,19 @@ type IncusOSProvider struct {
 
 // IncusOSProviderModel describes the provider configuration data model.
 type IncusOSProviderModel struct {
-	Remote             types.String `tfsdk:"remote"`
-	ConfigDir          types.String `tfsdk:"config_dir"`
-	Address            types.String `tfsdk:"address"`
-	PathPrefix         types.String `tfsdk:"path_prefix"`
-	ClientCert         types.String `tfsdk:"client_cert"`
-	ClientKey          types.String `tfsdk:"client_key"`
-	ClientCertPath     types.String `tfsdk:"client_cert_path"`
-	ClientKeyPath      types.String `tfsdk:"client_key_path"`
-	ServerCert         types.String `tfsdk:"server_cert"`
-	ServerCertPath     types.String `tfsdk:"server_cert_path"`
-	InsecureSkipVerify types.Bool   `tfsdk:"insecure_skip_verify"`
-	Timeout            types.String `tfsdk:"timeout"`
+	Remote                     types.String `tfsdk:"remote"`
+	ConfigDir                  types.String `tfsdk:"config_dir"`
+	Address                    types.String `tfsdk:"address"`
+	PathPrefix                 types.String `tfsdk:"path_prefix"`
+	ClientCert                 types.String `tfsdk:"client_cert"`
+	ClientKey                  types.String `tfsdk:"client_key"`
+	ClientCertPath             types.String `tfsdk:"client_cert_path"`
+	ClientKeyPath              types.String `tfsdk:"client_key_path"`
+	ServerCert                 types.String `tfsdk:"server_cert"`
+	ServerCertPath             types.String `tfsdk:"server_cert_path"`
+	InsecureSkipVerify         types.Bool   `tfsdk:"insecure_skip_verify"`
+	Timeout                    types.String `tfsdk:"timeout"`
+	NetworkConfirmationTimeout types.String `tfsdk:"network_confirmation_timeout"`
 }
 
 // New returns a provider factory function.
@@ -110,6 +113,10 @@ func (p *IncusOSProvider) Schema(_ context.Context, _ provider.SchemaRequest, re
 			},
 			"timeout": schema.StringAttribute{
 				MarkdownDescription: "HTTP request timeout as a Go duration string (e.g., `60s`, `5m`). Defaults to `60s`. Can also be set via `INCUSOS_TIMEOUT`.",
+				Optional:            true,
+			},
+			"network_confirmation_timeout": schema.StringAttribute{
+				MarkdownDescription: "Default rollback confirmation timeout duration for `incusos_system_network` changes (e.g., `60s`, `2m`). Set to `0` or `0s` to disable automatic rollback protection by default. Defaults to `60s`. Can also be set via `INCUSOS_NETWORK_CONFIRMATION_TIMEOUT`.",
 				Optional:            true,
 			},
 		},
@@ -223,6 +230,30 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 		timeout = parsed
 	}
 
+	networkConfirmationTimeout := defaultNetworkConfirmationTimeout
+	if raw := stringOrEnv(data.NetworkConfirmationTimeout, "INCUSOS_NETWORK_CONFIRMATION_TIMEOUT"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			resp.Diagnostics.AddError(
+				"Invalid Network Confirmation Timeout",
+				fmt.Sprintf("Failed to parse network_confirmation_timeout duration %q: %s", raw, err),
+			)
+
+			return
+		}
+
+		if parsed < 0 {
+			resp.Diagnostics.AddError(
+				"Invalid Network Confirmation Timeout",
+				fmt.Sprintf("network_confirmation_timeout must be zero or positive, got %q", raw),
+			)
+
+			return
+		}
+
+		networkConfirmationTimeout = parsed
+	}
+
 	c, err := client.New(client.Config{
 		Address:             address,
 		UnixSocket:          unixSocket,
@@ -243,8 +274,13 @@ func (p *IncusOSProvider) Configure(ctx context.Context, req provider.ConfigureR
 		return
 	}
 
-	resp.DataSourceData = c
-	resp.ResourceData = c
+	cfg := &providerConfig{
+		client:                     c,
+		networkConfirmationTimeout: networkConfirmationTimeout,
+	}
+
+	resp.DataSourceData = cfg
+	resp.ResourceData = cfg
 }
 
 // promptPassphraseFunc prompts for a private key passphrase. Overridable in tests.
