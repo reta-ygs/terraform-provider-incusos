@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -10,22 +11,41 @@ import (
 	"github.com/reta-ygs/terraform-provider-incusos/internal/client"
 )
 
-func extractClient(providerData any, diags *diag.Diagnostics) *client.Client {
+type providerConfig struct {
+	client                     *client.Client
+	networkConfirmationTimeout time.Duration
+}
+
+func extractProviderConfig(providerData any, diags *diag.Diagnostics) *providerConfig {
 	if providerData == nil {
 		return nil
 	}
 
-	c, ok := providerData.(*client.Client)
-	if !ok {
+	switch v := providerData.(type) {
+	case *providerConfig:
+		return v
+	case *client.Client:
+		return &providerConfig{
+			client:                     v,
+			networkConfirmationTimeout: defaultNetworkConfirmationTimeout,
+		}
+	default:
 		diags.AddError(
 			"Unexpected Provider Data Type",
-			fmt.Sprintf("Expected *client.Client, got: %T. Please report this issue to the provider developers.", providerData),
+			fmt.Sprintf("Expected *providerConfig, got: %T. Please report this issue to the provider developers.", providerData),
 		)
 
 		return nil
 	}
+}
 
-	return c
+func extractClient(providerData any, diags *diag.Diagnostics) *client.Client {
+	cfg := extractProviderConfig(providerData, diags)
+	if cfg == nil {
+		return nil
+	}
+
+	return cfg.client
 }
 
 func listToStringSlice(ctx context.Context, list types.List, diags *diag.Diagnostics) []string {

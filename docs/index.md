@@ -52,6 +52,7 @@ provider "incusos" {}
 - `client_key_path` (String) Path to a PEM-encoded TLS client private key file. Can also be set via `INCUSOS_CLIENT_KEY_PATH`.
 - `config_dir` (String) Incus CLI configuration directory containing `config.yml`, `client.crt`, `client.key`, and `servercerts/`. Defaults to `INCUS_CONF` or the platform default (`~/.config/incus` on Linux).
 - `insecure_skip_verify` (Boolean) Disable TLS server certificate verification (not recommended for production). Can also be set via `INCUSOS_INSECURE_SKIP_VERIFY`.
+- `network_confirmation_timeout` (String) Default rollback confirmation timeout duration for `incusos_system_network` changes (e.g., `60s`, `2m`). Set to `0` or `0s` to disable automatic rollback protection by default. Defaults to `60s`. Can also be set via `INCUSOS_NETWORK_CONFIRMATION_TIMEOUT`.
 - `path_prefix` (String) URL path prefix before `/1.0/...`. Defaults to `/os` (the Incus HTTPS proxy path). Can also be set via `INCUSOS_PATH_PREFIX`.
 - `remote` (String) Incus CLI remote name from `config.yml` to load connection address and TLS certificates from. Can also be set via `INCUSOS_REMOTE` or `INCUS_REMOTE` (matching the Incus CLI). Explicit attributes and `INCUSOS_*` environment variables take precedence over remote settings.
 - `server_cert` (String) PEM-encoded server or CA TLS certificate to trust. Supports pinning self-signed Incus server certificates. Can also be set via `INCUSOS_SERVER_CERT`.

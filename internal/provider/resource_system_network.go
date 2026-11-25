@@ -2,6 +2,9 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -16,13 +19,20 @@ import (
 	"github.com/reta-ygs/terraform-provider-incusos/internal/client"
 )
 
+const (
+	confirmInitialBackoff = 200 * time.Millisecond
+	confirmMaxBackoff     = 2 * time.Second
+	confirmAttemptTimeout = 5 * time.Second
+)
+
 var (
 	_ resource.Resource                = (*systemNetworkResource)(nil)
 	_ resource.ResourceWithImportState = (*systemNetworkResource)(nil)
 )
 
 type systemNetworkResource struct {
-	client *client.Client
+	client                     *client.Client
+	networkConfirmationTimeout time.Duration
 }
 
 type systemNetworkModel struct {
@@ -221,11 +231,11 @@ func (r *systemNetworkResource) Schema(_ context.Context, _ resource.SchemaReque
 				},
 			},
 			"confirmation_timeout": schema.StringAttribute{
-				MarkdownDescription: "Optional rollback timeout duration (e.g., `60s`) if network changes are not confirmed.",
+				MarkdownDescription: "Optional per-resource rollback timeout duration (e.g., `60s`, `2m`) overriding the provider's `network_confirmation_timeout`. Set to `0` or `0s` to disable sending a confirmation timeout on apply.",
 				Optional:            true,
 			},
 			"default_confirmation_timeout": schema.StringAttribute{
-				MarkdownDescription: "Default rollback timeout duration when `confirmation_timeout` is not specified.",
+				MarkdownDescription: "Persistent OS-level default rollback timeout duration stored on IncusOS for network changes that do not specify `confirmation_timeout`.",
 				Optional:            true,
 			},
 			"ignore_service_checks": schema.BoolAttribute{
@@ -235,7 +245,7 @@ func (r *systemNetworkResource) Schema(_ context.Context, _ resource.SchemaReque
 				Default:             booldefault.StaticBool(false),
 			},
 			"auto_confirm": schema.BoolAttribute{
-				MarkdownDescription: "Automatically call `POST /1.0/system/network/:confirm` after applying changes when a confirmation timeout is configured.",
+				MarkdownDescription: "Automatically call `POST /1.0/system/network/:confirm` (with retry) after applying changes when a confirmation is pending. Defaults to `true`.",
 				Optional:            true,
 				Computed:            true,
 				Default:             booldefault.StaticBool(true),
@@ -384,7 +394,13 @@ func (r *systemNetworkResource) Schema(_ context.Context, _ resource.SchemaReque
 }
 
 func (r *systemNetworkResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
-	r.client = extractClient(req.ProviderData, &resp.Diagnostics)
+	cfg := extractProviderConfig(req.ProviderData, &resp.Diagnostics)
+	if cfg == nil {
+		return
+	}
+
+	r.client = cfg.client
+	r.networkConfirmationTimeout = cfg.networkConfirmationTimeout
 }
 
 func (r *systemNetworkResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -440,10 +456,111 @@ func (r *systemNetworkResource) ImportState(ctx context.Context, req resource.Im
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
+func (r *systemNetworkResource) resolveConfirmationTimeout(plan *systemNetworkModel, diags *diag.Diagnostics) (time.Duration, string, bool) {
+	if !plan.ConfirmationTimeout.IsNull() && !plan.ConfirmationTimeout.IsUnknown() && plan.ConfirmationTimeout.ValueString() != "" {
+		raw := plan.ConfirmationTimeout.ValueString()
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			diags.AddError("Invalid confirmation_timeout", fmt.Sprintf("Failed to parse confirmation_timeout duration %q: %s", raw, err))
+
+			return 0, "", false
+		}
+
+		if parsed < 0 {
+			diags.AddError("Invalid confirmation_timeout", fmt.Sprintf("confirmation_timeout must be zero or positive, got %q", raw))
+
+			return 0, "", false
+		}
+
+		if parsed == 0 {
+			return 0, "", true
+		}
+
+		return parsed, raw, true
+	}
+
+	if r.networkConfirmationTimeout > 0 {
+		return r.networkConfirmationTimeout, r.networkConfirmationTimeout.String(), true
+	}
+
+	return 0, "", true
+}
+
+func (r *systemNetworkResource) confirmWithRetry(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	confirmCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	backoff := confirmInitialBackoff
+	var lastErr error
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return lastErr
+			}
+
+			return confirmCtx.Err()
+		}
+
+		attemptTimeout := confirmAttemptTimeout
+		if remaining < attemptTimeout {
+			attemptTimeout = remaining
+		}
+
+		attemptCtx, attemptCancel := context.WithTimeout(confirmCtx, attemptTimeout)
+		err := r.client.ConfirmSystemNetwork(attemptCtx)
+		attemptCancel()
+		if err == nil {
+			return nil
+		}
+
+		var apiErr *client.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+			return err
+		}
+
+		lastErr = err
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-confirmCtx.Done():
+			timer.Stop()
+
+			return lastErr
+		case <-timer.C:
+		}
+
+		backoff *= 2
+		if backoff > confirmMaxBackoff {
+			backoff = confirmMaxBackoff
+		}
+	}
+}
+
 func (r *systemNetworkResource) applyAndRead(ctx context.Context, plan *systemNetworkModel, diags *diag.Diagnostics) {
+	effectiveTimeout, effectiveTimeoutStr, ok := r.resolveConfirmationTimeout(plan, diags)
+	if !ok {
+		return
+	}
+
 	payload := plan.toAPI(ctx, diags)
 	if diags.HasError() {
 		return
+	}
+
+	payload.Config.ConfirmationTimeout = effectiveTimeoutStr
+
+	// IncusOS triggers a pending confirmation when either the PUT carries a positive
+	// confirmation_timeout OR the prior running config had default_confirmation_timeout set.
+	pendingTimeout := effectiveTimeout
+	if pendingTimeout == 0 && plan.AutoConfirm.ValueBool() {
+		if existing, err := r.client.GetSystemNetwork(ctx); err == nil && existing.Config != nil && existing.Config.DefaultConfirmationTimeout != "" {
+			if parsed, parseErr := time.ParseDuration(existing.Config.DefaultConfirmationTimeout); parseErr == nil && parsed > 0 {
+				pendingTimeout = parsed
+			}
+		}
 	}
 
 	if err := r.client.UpdateSystemNetwork(ctx, payload); err != nil {
@@ -452,9 +569,12 @@ func (r *systemNetworkResource) applyAndRead(ctx context.Context, plan *systemNe
 		return
 	}
 
-	if plan.AutoConfirm.ValueBool() && (plan.ConfirmationTimeout.ValueString() != "" || plan.DefaultConfirmationTimeout.ValueString() != "") {
-		if err := r.client.ConfirmSystemNetwork(ctx); err != nil {
-			diags.AddError("Failed to confirm system network changes", err.Error())
+	if plan.AutoConfirm.ValueBool() && pendingTimeout > 0 {
+		if err := r.confirmWithRetry(ctx, pendingTimeout); err != nil {
+			diags.AddError(
+				"Failed to confirm system network changes",
+				fmt.Sprintf("%s (IncusOS will automatically roll back unconfirmed network changes after %s)", err.Error(), pendingTimeout),
+			)
 
 			return
 		}
@@ -727,7 +847,8 @@ func (r *systemNetworkResource) readIntoModel(ctx context.Context, model *system
 	}
 
 	cfg := res.Config
-	model.ConfirmationTimeout = stringValueOrNull(cfg.ConfirmationTimeout, model.ConfirmationTimeout.IsNull())
+	// ConfirmationTimeout is a one-shot apply parameter cleared by IncusOS after PUT
+	// and never returned by GET; preserve the configured value in state.
 	model.DefaultConfirmationTimeout = stringValueOrNull(cfg.DefaultConfirmationTimeout, model.DefaultConfirmationTimeout.IsNull())
 	model.IgnoreServiceChecks = types.BoolValue(cfg.IgnoreServiceChecks)
 
